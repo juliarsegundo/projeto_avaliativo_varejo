@@ -17,6 +17,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from datetime import datetime
 
 
 # 1. CONFIGURACOES DO PROJETO
