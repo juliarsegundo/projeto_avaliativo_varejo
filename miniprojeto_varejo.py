@@ -152,3 +152,98 @@ def validar_identificador_compra(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
 
     return df_valido, df_inconsistente
 
+# 4. PIPELINE PRINCIPAL
+
+def carregar_dados(caminho: Path) -> pd.DataFrame:
+    """
+    Carrega a base com pandas.
+    O arquivo usa ponto e virgula como separador.
+    """
+    return pd.read_csv(caminho, sep=";", encoding="latin1")
+
+
+def limpar_base(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """
+    Executa o pipeline de limpeza exigido no mini-projeto.
+    """
+    relatorio = {}
+    df = df.copy()
+
+    relatorio["shape_original"] = df.shape
+
+    # Remove colunas vazias extras e padroniza nomes.
+    df = limpar_colunas(df)
+    relatorio["shape_sem_colunas_vazias"] = df.shape
+
+    # Converte strings que representam nulos em nulo real do pandas/numpy.
+    df = df.replace({
+        "NULL": np.nan,
+        "N/A": np.nan,
+        "": np.nan,
+        " ": np.nan
+    })
+
+    # Padroniza campos de texto.
+    colunas_texto = ["CL_GENERO", "CL_SEG", "PR_CAT", "PR_NOME"]
+    df = padronizar_textos(df, colunas_texto)
+
+    # Converte colunas inteiras. IDs nulos sao considerados registros invalidos.
+    colunas_inteiras = ["CO_ID", "CL_ID", "CL_EC", "CL_FHL", "PR_ID"]
+    for coluna in colunas_inteiras:
+        df = converter_coluna_inteira(df, coluna)
+
+    # Remove registros sem identificadores essenciais.
+    linhas_antes_ids = len(df)
+    df = df.dropna(subset=["CO_ID", "CL_ID", "PR_ID"])
+    relatorio["linhas_removidas_ids_nulos"] = linhas_antes_ids - len(df)
+
+    # Trata categoria vazia/inconsistente.
+    qtd_categoria_inconsistente = df["PR_CAT"].isna().sum() + (df["PR_CAT"] == "#N/D").sum()
+    df = tratar_categoria(df)
+    relatorio["categorias_preenchidas_sem_categoria"] = int(qtd_categoria_inconsistente)
+
+    # Trata campos dimensionais de cliente/produto.
+    # Justificativa: campos descritivos nulos sao preenchidos para preservar registros de compra.
+    for coluna in ["CL_GENERO", "CL_SEG", "PR_NOME"]:
+        if coluna in df.columns:
+            df[coluna] = df[coluna].fillna("Nao informado")
+
+    # Trata nulos da coluna numerica de numero de filhos pela mediana.
+    # Justificativa: mediana reduz efeito de distribuicoes assimetricas.
+    if "CL_FHL" in df.columns:
+        mediana_filhos = df["CL_FHL"].median()
+        df["CL_FHL"] = df["CL_FHL"].fillna(mediana_filhos)
+        df["CL_FHL"] = df["CL_FHL"].astype("Int64")
+
+    # Estado civil e uma dimensao codificada. Se houver nulo, usa a moda.
+    if "CL_EC" in df.columns and df["CL_EC"].isna().any():
+        moda_estado_civil = df["CL_EC"].mode(dropna=True)[0]
+        df["CL_EC"] = df["CL_EC"].fillna(moda_estado_civil)
+
+    # Conversao de data para datetime.
+    # A funcao converter_data acima mostra a regra com o modulo datetime;
+    # aqui usamos pd.to_datetime de forma vetorizada para executar melhor em 830 mil linhas.
+    df["DATA"] = pd.to_datetime(df["DATA"].astype("string").str.strip(), format="%d/%m/%Y", errors="coerce")
+    relatorio["datas_invalidas"] = int(df["DATA"].isna().sum())
+    df = df.dropna(subset=["DATA"])
+
+    # Valida regra do identificador de compra.
+    df, df_compras_inconsistentes = validar_identificador_compra(df)
+    relatorio["registros_compra_inconsistentes"] = int(len(df_compras_inconsistentes))
+
+    # Remove duplicatas relevantes.
+    # Como nao existe coluna de quantidade, linhas identicas de compra/produto sao tratadas como duplicadas.
+    linhas_antes_duplicatas = len(df)
+    colunas_duplicidade = [
+        "DATA", "CO_ID", "CL_ID", "CL_GENERO", "CL_EC",
+        "CL_FHL", "CL_SEG", "PR_ID", "PR_CAT", "PR_NOME"
+    ]
+    df = df.drop_duplicates(subset=colunas_duplicidade, keep="first")
+    relatorio["duplicatas_removidas"] = int(linhas_antes_duplicatas - len(df))
+
+    # Reindexa a base apos remocoes.
+    df = df.reset_index(drop=True)
+    relatorio["shape_final"] = df.shape
+
+    return df, relatorio
+
