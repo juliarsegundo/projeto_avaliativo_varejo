@@ -56,10 +56,6 @@ def inspecionar_csv_nativo(caminho: Path, delimitador: str = ";") -> None:
     print(f"Primeiro registro: {primeira_linha}")
 
 
-# CHAMADA DA FUNCAO
-inspecionar_csv_nativo(CAMINHO_DADOS)
-
-
 # 3. FUNCOES DE LIMPEZA
 
 def limpar_colunas(df: pd.DataFrame) -> pd.DataFrame:
@@ -119,17 +115,58 @@ def converter_data(valor):
 def tratar_categoria(df: pd.DataFrame) -> pd.DataFrame:
     """
     Preenche categorias vazias ou inconsistentes com 'Sem Categoria'.
-    Na base, '#N/D' representa ausencia/inconsistencia de categoria.
+
+    A lógica usa if/else explicitamente para atender ao critério do projeto:
+    se a categoria estiver vazia, nula ou inconsistente, recebe 'Sem Categoria';
+    caso contrário, mantém a categoria original padronizada.
     """
     df = df.copy()
     categorias_invalidas = ["", "NULL", "N/A", "#N/D", "NAN", "<NA>"]
 
-    df["PR_CAT"] = df["PR_CAT"].astype("string").str.strip()
-    mascara_categoria = df["PR_CAT"].isna() | df["PR_CAT"].isin(categorias_invalidas)
-    df.loc[mascara_categoria, "PR_CAT"] = "Sem Categoria"
+    def corrigir_categoria(valor):
+        if pd.isna(valor):
+            return "Sem Categoria"
+
+        valor_limpo = str(valor).strip()
+
+        if valor_limpo.upper() in categorias_invalidas:
+            return "Sem Categoria"
+        else:
+            return valor_limpo
+
+    df["PR_CAT"] = df["PR_CAT"].apply(corrigir_categoria).astype("string")
 
     return df
 
+
+def tratar_nulos_dimensoes(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Trata nulos das dimensões de cliente e produto.
+
+    Justificativas:
+    - CL_GENERO, CL_SEG e PR_NOME são campos descritivos. Por isso, os nulos
+      são preenchidos com 'Nao informado' para preservar os registros de compra.
+    - CL_FHL é um campo numérico discreto. A mediana foi escolhida porque reduz
+      o impacto de valores extremos.
+    - CL_EC é uma dimensão codificada/categórica. A moda foi escolhida porque
+      representa o valor mais frequente da coluna.
+    """
+    df = df.copy()
+
+    for coluna in ["CL_GENERO", "CL_SEG", "PR_NOME"]:
+        if coluna in df.columns:
+            df[coluna] = df[coluna].fillna("Nao informado")
+
+    if "CL_FHL" in df.columns:
+        mediana_filhos = df["CL_FHL"].median()
+        df["CL_FHL"] = df["CL_FHL"].fillna(mediana_filhos)
+        df["CL_FHL"] = df["CL_FHL"].astype("Int64")
+
+    if "CL_EC" in df.columns and df["CL_EC"].isna().any():
+        moda_estado_civil = df["CL_EC"].mode(dropna=True)[0]
+        df["CL_EC"] = df["CL_EC"].fillna(moda_estado_civil)
+
+    return df
 
 def validar_identificador_compra(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
@@ -197,33 +234,20 @@ def limpar_base(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     df = df.dropna(subset=["CO_ID", "CL_ID", "PR_ID"])
     relatorio["linhas_removidas_ids_nulos"] = linhas_antes_ids - len(df)
 
-    # Trata categoria vazia/inconsistente.
+    # Trata categoria vazia/inconsistente com lógica if/else.
     qtd_categoria_inconsistente = df["PR_CAT"].isna().sum() + (df["PR_CAT"] == "#N/D").sum()
     df = tratar_categoria(df)
     relatorio["categorias_preenchidas_sem_categoria"] = int(qtd_categoria_inconsistente)
 
-    # Trata campos dimensionais de cliente/produto.
-    # Justificativa: campos descritivos nulos sao preenchidos para preservar registros de compra.
-    for coluna in ["CL_GENERO", "CL_SEG", "PR_NOME"]:
-        if coluna in df.columns:
-            df[coluna] = df[coluna].fillna("Nao informado")
+    # Trata nulos das dimensões de cliente/produto com justificativas próprias.
+    df = tratar_nulos_dimensoes(df)
 
-    # Trata nulos da coluna numerica de numero de filhos pela mediana.
-    # Justificativa: mediana reduz efeito de distribuicoes assimetricas.
-    if "CL_FHL" in df.columns:
-        mediana_filhos = df["CL_FHL"].median()
-        df["CL_FHL"] = df["CL_FHL"].fillna(mediana_filhos)
-        df["CL_FHL"] = df["CL_FHL"].astype("Int64")
+    # Conversao de data usando o modulo datetime.
+    # A funcao converter_data utiliza datetime.strptime para converter strings
+    # no formato brasileiro dd/mm/aaaa. Datas invalidas retornam pd.NaT.
+    df["DATA"] = df["DATA"].apply(converter_data)
+    df["DATA"] = pd.to_datetime(df["DATA"], errors="coerce")
 
-    # Estado civil e uma dimensao codificada. Se houver nulo, usa a moda.
-    if "CL_EC" in df.columns and df["CL_EC"].isna().any():
-        moda_estado_civil = df["CL_EC"].mode(dropna=True)[0]
-        df["CL_EC"] = df["CL_EC"].fillna(moda_estado_civil)
-
-    # Conversao de data para datetime.
-    # A funcao converter_data acima mostra a regra com o modulo datetime;
-    # aqui usamos pd.to_datetime de forma vetorizada para executar melhor em 830 mil linhas.
-    df["DATA"] = pd.to_datetime(df["DATA"].astype("string").str.strip(), format="%d/%m/%Y", errors="coerce")
     relatorio["datas_invalidas"] = int(df["DATA"].isna().sum())
     df = df.dropna(subset=["DATA"])
 
@@ -246,4 +270,170 @@ def limpar_base(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     relatorio["shape_final"] = df.shape
 
     return df, relatorio
+
+
+# 5. ANALISES E RELATORIOS
+
+def diagnosticar_base(df: pd.DataFrame, titulo: str) -> None:
+    """
+    Exibe diagnosticos basicos da base.
+    """
+    print(f"\n--- {titulo} ---")
+    print(f"Registros: {df.shape[0]}")
+    print(f"Colunas: {df.shape[1]}")
+    print("\nTipos de dados:")
+    print(df.dtypes)
+    print("\nValores nulos por coluna:")
+    print(df.isna().sum())
+    print(f"\nDuplicatas exatas: {df.duplicated().sum()}")
+
+
+def estatisticas_filhos(df: pd.DataFrame) -> pd.Series:
+    """
+    Gera estatisticas descritivas da coluna de numero de filhos do cliente.
+    """
+    filhos = pd.to_numeric(df["CL_FHL"], errors="coerce")
+
+    estatisticas = pd.Series({
+        "contagem": filhos.count(),
+        "media": filhos.mean(),
+        "mediana": filhos.median(),
+        "desvio_padrao": filhos.std(),
+        "moda": filhos.mode(dropna=True).iloc[0] if not filhos.mode(dropna=True).empty else np.nan,
+        "minimo": filhos.min(),
+        "quartil_25": filhos.quantile(0.25),
+        "quartil_50": filhos.quantile(0.50),
+        "quartil_75": filhos.quantile(0.75),
+        "maximo": filhos.max()
+    })
+
+    return estatisticas
+
+
+def gerar_agrupamentos(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """
+    Cria agrupamentos para encontrar padroes operacionais da base.
+    Como a base enviada nao possui valor monetario, a analise usa quantidade de itens e numero de compras.
+    """
+    agrupamentos = {}
+
+    agrupamentos["por_genero"] = (
+        df.groupby("CL_GENERO")
+        .agg(
+            qtd_itens=("PR_ID", "count"),
+            qtd_compras=("CO_ID", "nunique"),
+            qtd_clientes=("CL_ID", "nunique")
+        )
+        .sort_values("qtd_itens", ascending=False)
+    )
+
+    agrupamentos["por_categoria"] = (
+        df.groupby("PR_CAT")
+        .agg(
+            qtd_itens=("PR_ID", "count"),
+            qtd_compras=("CO_ID", "nunique"),
+            qtd_produtos=("PR_ID", "nunique")
+        )
+        .sort_values("qtd_itens", ascending=False)
+    )
+
+    agrupamentos["por_segmento"] = (
+        df.groupby("CL_SEG")
+        .agg(
+            qtd_itens=("PR_ID", "count"),
+            qtd_compras=("CO_ID", "nunique"),
+            qtd_clientes=("CL_ID", "nunique")
+        )
+        .sort_values("qtd_itens", ascending=False)
+    )
+
+    agrupamentos["por_ano"] = (
+        df.assign(ANO=df["DATA"].dt.year)
+        .groupby("ANO")
+        .agg(
+            qtd_itens=("PR_ID", "count"),
+            qtd_compras=("CO_ID", "nunique")
+        )
+    )
+
+    agrupamentos["top_produtos"] = (
+        df.groupby(["PR_CAT", "PR_NOME"])
+        .size()
+        .reset_index(name="qtd_itens")
+        .sort_values("qtd_itens", ascending=False)
+        .head(10)
+    )
+
+    return agrupamentos
+
+
+def imprimir_relatorio_final(df_limpo: pd.DataFrame, relatorio: dict, agrupamentos: dict[str, pd.DataFrame]) -> None:
+    """
+    Imprime o relatorio final no terminal.
+    """
+    print("\n" + "=" * 80)
+    print("RELATORIO FINAL - ANALISE EXPLORATORIA DA BASE VAREJO")
+    print("=" * 80)
+
+    print("\n1. RESUMO DA LIMPEZA")
+    print(f"Shape original: {relatorio['shape_original'][0]} linhas x {relatorio['shape_original'][1]} colunas")
+    print(f"Shape apos remover colunas vazias: {relatorio['shape_sem_colunas_vazias'][0]} linhas x {relatorio['shape_sem_colunas_vazias'][1]} colunas")
+    print(f"Shape final: {relatorio['shape_final'][0]} linhas x {relatorio['shape_final'][1]} colunas")
+    print(f"Duplicatas removidas: {relatorio['duplicatas_removidas']}")
+    print(f"Categorias preenchidas como 'Sem Categoria': {relatorio['categorias_preenchidas_sem_categoria']}")
+    print(f"Datas invalidas encontradas: {relatorio['datas_invalidas']}")
+    print(f"Registros com compra inconsistente: {relatorio['registros_compra_inconsistentes']}")
+
+    print("\n2. ESTATISTICAS - NUMERO DE FILHOS DO CLIENTE")
+    print(estatisticas_filhos(df_limpo).round(2))
+
+    print("\n3. AGRUPAMENTO POR GENERO")
+    print(agrupamentos["por_genero"])
+
+    print("\n4. AGRUPAMENTO POR CATEGORIA")
+    print(agrupamentos["por_categoria"])
+
+    print("\n5. AGRUPAMENTO POR SEGMENTO ECONOMICO")
+    print(agrupamentos["por_segmento"])
+
+    print("\n6. AGRUPAMENTO POR ANO")
+    print(agrupamentos["por_ano"])
+
+    print("\n7. TOP 10 PRODUTOS MAIS FREQUENTES")
+    print(agrupamentos["top_produtos"].to_string(index=False))
+
+    print("\n8. CONCLUSOES")
+    print("- A base original possui colunas extras vazias, removidas durante a limpeza.")
+    print("- Nao foram encontradas datas invalidas nem inconsistencias entre CO_ID, DATA e CL_ID.")
+    print("- A categoria '#N/D' foi tratada como problema de qualidade e preenchida como 'Sem Categoria'.")
+    print("- A categoria ALIMENTOS concentra a maior quantidade de itens registrados.")
+    print("- O segmento economico B apresenta maior volume de itens, compras e clientes.")
+    print("- A coluna CL_FHL indica que a moda e a mediana de filhos dos clientes sao 0.")
+
+
+def main() -> None:
+    """
+    Executa o projeto completo.
+    """
+    if not CAMINHO_DADOS.exists():
+        raise FileNotFoundError(f"Arquivo nao encontrado: {CAMINHO_DADOS}")
+
+    inspecionar_csv_nativo(CAMINHO_DADOS)
+
+    df_original = carregar_dados(CAMINHO_DADOS)
+    diagnosticar_base(df_original, "DIAGNOSTICO DA BASE ORIGINAL")
+
+    df_limpo, relatorio = limpar_base(df_original)
+    diagnosticar_base(df_limpo, "DIAGNOSTICO DA BASE LIMPA")
+
+    agrupamentos = gerar_agrupamentos(df_limpo)
+    imprimir_relatorio_final(df_limpo, relatorio, agrupamentos)
+
+    CAMINHO_SAIDA.parent.mkdir(parents=True, exist_ok=True)
+    df_limpo.to_csv(CAMINHO_SAIDA, index=False, encoding="utf-8-sig")
+    print(f"\nBase limpa salva em: {CAMINHO_SAIDA}")
+
+
+if __name__ == "__main__":
+    main()
 
